@@ -1,0 +1,17 @@
+{
+  "proton_config_path": "C:\\Users\\Admin\\AppData\\Local\\Proton\\Proton VPN\\Storage\\UserSettings.65256c91ff480ec5ad34b542e8af8348b7e7430a.json",
+  "proton_exe_path": "C:\\Program Files\\Proton\\VPN\\ProtonVPN.Launcher.exe",
+  "launch_proton_after_apply": true,
+  "scan_paths": [
+    "C:/Program Files/Git",
+    "C:/Program Files/qBittorrent",
+    "C:/Users/Admin/AppData/Local/Discord",
+    "C:/Users/Admin/AppData/Local/vesktop",
+    "C:/Games/Sekiro Shadows Die Twice GOTY Edition",
+    "C:/Users/Admin/AppData/Local/Programs/Legcord"
+  ],
+  "exclude_scan_folders": ["C:\\Program Files\\Proton", "C:\\Program Files\\Git\\mingw64", "C:\\Program Files\\Git\\usr"],
+  "mode": "include",
+  "recursive": true,
+  "only_network_active": false
+}
