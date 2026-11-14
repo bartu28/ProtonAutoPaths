@@ -90,7 +90,10 @@ def save_settings(settings: dict) -> None:
 
 # ── scan + apply ─────────────────────────────────────────────────────────────
 def find_executables(folders: list[str], skip_folders: list[str]) -> list[str]:
-    """Find every .exe inside each folder, skipping any skip_folders subtree."""
+    """Find every .exe inside each folder, skipping anything under skip_folders.
+
+    Both lists may also name single .exe files.
+    """
     skip = [normalize_path(f) for f in skip_folders if f]
 
     def skipped(path: Path) -> bool:
@@ -98,11 +101,16 @@ def find_executables(folders: list[str], skip_folders: list[str]) -> list[str]:
         return any(norm == s or norm.startswith(s + os.sep) for s in skip)
 
     found = set()
-    for folder in folders:
-        base = Path(folder).expanduser()
-        if not base.is_dir():
+    for entry in folders:
+        base = Path(entry).expanduser()
+        if base.is_dir():
+            candidates = base.rglob("*.exe")
+        elif base.suffix.lower() == ".exe":
+            # An entry may also be a single app rather than a folder.
+            candidates = [base]
+        else:
             continue
-        for exe in base.rglob("*.exe"):
+        for exe in candidates:
             if exe.is_file() and not skipped(exe):
                 found.add(str(exe.resolve()))
     return sorted(found)
@@ -212,9 +220,37 @@ def set_startup(enabled: bool) -> None:
                 pass
 
 
+def resolve_shortcut(path: str) -> str:
+    """Return what a .lnk points to; any other path is returned unchanged.
+
+    The Windows file dialog normally resolves shortcuts itself, so this only
+    does work when it hands back the .lnk. WScript.Shell is used through
+    PowerShell to avoid a pywin32 dependency.
+    """
+    if not path.lower().endswith(".lnk"):
+        return path
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "(New-Object -ComObject WScript.Shell)"
+            ".CreateShortcut($env:PAP_LNK).TargetPath",
+        ],
+        # -Command pastes extra arguments into the script text, so a path with
+        # spaces or quotes would break it; pass the path through the environment.
+        env={**os.environ, "PAP_LNK": path},
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return result.stdout.strip()
+
+
 # ── UI ───────────────────────────────────────────────────────────────────────
 class FolderList:
-    """A labelled listbox of folders with Add / Remove buttons."""
+    """A labelled listbox of folders and single apps with Add / Remove buttons."""
 
     def __init__(self, parent: ttk.Frame, row: int, label: str):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", pady=(10, 0))
@@ -225,6 +261,9 @@ class FolderList:
         buttons = ttk.Frame(parent)
         buttons.grid(row=row, column=2, sticky="n", pady=(10, 0))
         ttk.Button(buttons, text="Add", command=self.add).grid(sticky="ew", pady=2)
+        ttk.Button(buttons, text="Add folder", command=self.add_folder).grid(
+            sticky="ew", pady=2
+        )
         ttk.Button(buttons, text="Remove", command=self.remove).grid(
             sticky="ew", pady=2
         )
@@ -237,10 +276,61 @@ class FolderList:
         for folder in folders:
             self.listbox.insert(tk.END, folder)
 
-    def add(self) -> None:
+    def _insert(self, folder: str) -> None:
+        known = {normalize_path(f) for f in self.get()}
+        if normalize_path(folder) not in known:
+            self.listbox.insert(tk.END, os.path.normpath(folder))
+
+    def add_folder(self) -> None:
         folder = filedialog.askdirectory()
-        if folder and folder not in self.get():
-            self.listbox.insert(tk.END, folder)
+        if folder:
+            self._insert(folder)
+
+    def add(self) -> None:
+        """Pick one or more apps (or shortcuts), then add them or their folder.
+
+        Windows has no dialog that selects both files and folders, and the
+        folder picker hides shortcuts. A file dialog shows shortcuts and follows
+        them, so the user picks apps there and is then asked whether they meant
+        the apps themselves or the whole folder they live in.
+        """
+        picked = filedialog.askopenfilenames(
+            title="Pick apps or shortcuts",
+            filetypes=[("Apps and shortcuts", "*.exe *.lnk")],
+        )
+        targets = []
+        for path in picked:
+            try:
+                target = resolve_shortcut(path)
+            except Exception as exc:
+                messagebox.showerror("Error", f"Could not read shortcut:\n{exc}")
+                return
+            if os.path.isdir(target) or target.lower().endswith(".exe"):
+                targets.append(os.path.normpath(target))
+            else:
+                messagebox.showerror(
+                    "Error", f"Does not point to an app or folder:\n{path}"
+                )
+                return
+        if not targets:
+            return
+
+        folders = list(
+            dict.fromkeys(t if os.path.isdir(t) else os.path.dirname(t) for t in targets)
+        )
+        if folders == targets:  # only shortcuts to folders were picked
+            whole_folder = True
+        else:
+            whole_folder = messagebox.askyesnocancel(
+                "Add what?",
+                "Add the whole folder (every app inside it)?\n\n"
+                + "\n".join(folders)
+                + "\n\nYes = the whole folder\nNo = only what you selected",
+            )
+            if whole_folder is None:
+                return
+        for entry in folders if whole_folder else targets:
+            self._insert(entry)
 
     def remove(self) -> None:
         for index in reversed(self.listbox.curselection()):
@@ -282,9 +372,9 @@ class ProtonAutoPathsUI:
             value="include",
         ).grid(row=0, column=1, padx=(12, 0))
 
-        self.folders = FolderList(frame, 2, "Folders:")
+        self.folders = FolderList(frame, 2, "Folders / apps:")
         self.folders.set(self.settings["scan_paths"])
-        self.skipped = FolderList(frame, 3, "Skip folders:")
+        self.skipped = FolderList(frame, 3, "Skip:")
         self.skipped.set(self.settings["exclude_scan_folders"])
 
         self.launch_var = tk.BooleanVar(value=self.settings["launch_proton_after_apply"])
