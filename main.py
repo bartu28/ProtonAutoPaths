@@ -460,7 +460,9 @@ class ProtonAutoPathsUI:
 
 def run_gui() -> None:
     root = tk.Tk()
-    ico = SETTINGS_FILE.parent / "icon.ico"
+    # icon.ico sits next to this file; in the PyInstaller exe that is the
+    # unpack directory, where the spec bundles it.
+    ico = Path(__file__).resolve().parent / "icon.ico"
     if ico.exists():
         root.iconbitmap(str(ico))
 
