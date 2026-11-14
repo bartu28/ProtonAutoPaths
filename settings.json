@@ -11,7 +11,5 @@
     "C:/Users/Admin/AppData/Local/Programs/Legcord"
   ],
   "exclude_scan_folders": ["C:\\Program Files\\Proton", "C:\\Program Files\\Git\\mingw64", "C:\\Program Files\\Git\\usr"],
-  "mode": "include",
-  "recursive": true,
-  "only_network_active": false
+  "mode": "include"
 }

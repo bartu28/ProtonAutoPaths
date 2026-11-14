@@ -1,4 +1,5 @@
-import argparse
+"""Add every .exe inside chosen folders to Proton VPN's split-tunneling list."""
+
 import json
 import os
 from pathlib import Path
@@ -18,105 +19,68 @@ try:
 except ImportError:
     darkdetect = None
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
+_LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
 
 # Always use the same settings.json regardless of where the exe is located.
-SETTINGS_FILE = (
-    Path(os.environ.get("LOCALAPPDATA", "~")) / "ProtonAutoPaths" / "settings.json"
-)
+SETTINGS_FILE = _LOCALAPPDATA / "ProtonAutoPaths" / "settings.json"
 SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+_PROTON_STORAGE = _LOCALAPPDATA / "Proton" / "Proton VPN" / "Storage"
+_PROTON_LAUNCHER = r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe"
+
+# Proton VPN's own executables must never be routed through the tunnel they create.
+_DEFAULT_SKIP_FOLDERS = [r"C:\Program Files\Proton"]
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "ProtonAutoPathsStartup"
+_APPLY_FLAG = "--scan-and-apply"
+
+# mode -> (Proton list key, Proton SplitTunnelingMode value)
+_MODES = {
+    "exclude": ("SplitTunnelingStandardAppsList", "Standard"),
+    "include": ("SplitTunnelingInverseAppsList", "Inverse"),
+}
 
 
 def normalize_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
 
 
-_TASK_NAME = "ProtonAutoPathsStartup"
-_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-
-
-def _pythonw() -> str:
-    """Return pythonw.exe path (no console window) next to the running Python."""
-    exe = Path(sys.executable)
-    pyw = exe.with_name("pythonw.exe")
-    return str(pyw) if pyw.exists() else sys.executable
-
-
-def launch_proton(exe_path: str) -> None:
-    path = Path(exe_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Proton VPN launcher not found: {exe_path}")
-    subprocess.Popen([str(path)], close_fds=True)
-
-
-def _startup_command() -> str:
-    """Return the command string to write into the Run registry key."""
-    if getattr(sys, "frozen", False):
-        # Running as a PyInstaller exe — call it directly
-        return f'"{sys.executable}" --scan-and-apply'
-    else:
-        script = str(Path(__file__).resolve())
-        python = _pythonw()
-        return f'"{python}" "{script}" --scan-and-apply'
-
-
-def register_startup_task() -> None:
-    """Add an HKCU Run entry so the tool runs at every user logon (no admin needed)."""
-    cmd = _startup_command()
-    with winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE
-    ) as key:
-        winreg.SetValueEx(key, _TASK_NAME, 0, winreg.REG_SZ, cmd)
-
-
-def unregister_startup_task() -> None:
-    """Remove the HKCU Run entry."""
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE
-        ) as key:
-            winreg.DeleteValue(key, _TASK_NAME)
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"Startup entry '{_TASK_NAME}' not found — it may not be registered."
-        )
-
-
-# Proton VPN's own executables must never be routed through the tunnel they create.
-_DEFAULT_EXCLUDE_FOLDERS: list[str] = [
-    r"C:\Program Files\Proton",
-]
+# ── settings ─────────────────────────────────────────────────────────────────
+def detect_proton_config() -> str:
+    """Return the most recently written Proton VPN UserSettings file, or ''."""
+    if not _PROTON_STORAGE.is_dir():
+        return ""
+    found = sorted(
+        _PROTON_STORAGE.glob("UserSettings*.json"), key=lambda p: p.stat().st_mtime
+    )
+    return str(found[-1]) if found else ""
 
 
 def default_settings() -> dict:
     return {
         "proton_config_path": "",
-        "proton_exe_path": r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe",
+        "proton_exe_path": _PROTON_LAUNCHER,
         "launch_proton_after_apply": True,
         "scan_paths": [],
-        "exclude_scan_folders": list(_DEFAULT_EXCLUDE_FOLDERS),
+        "exclude_scan_folders": list(_DEFAULT_SKIP_FOLDERS),
         "mode": "exclude",
-        "recursive": True,
-        "only_network_active": True,
     }
 
 
 def load_settings() -> dict:
-    defaults = default_settings()
-    if not SETTINGS_FILE.exists():
-        return defaults
-
-    with SETTINGS_FILE.open("r", encoding="utf-8-sig") as stream:
-        saved = json.load(stream)
-
-    defaults.update(saved)
-    if defaults["mode"] not in {"include", "exclude"}:
-        defaults["mode"] = "exclude"
-    return defaults
+    settings = default_settings()
+    if SETTINGS_FILE.exists():
+        with SETTINGS_FILE.open("r", encoding="utf-8-sig") as stream:
+            saved = json.load(stream)
+        # Keys from older versions (recursive, only_network_active) are dropped.
+        settings.update({k: v for k, v in saved.items() if k in settings})
+    if settings["mode"] not in _MODES:
+        settings["mode"] = "exclude"
+    if not settings["proton_config_path"]:
+        settings["proton_config_path"] = detect_proton_config()
+    return settings
 
 
 def save_settings(settings: dict) -> None:
@@ -124,181 +88,163 @@ def save_settings(settings: dict) -> None:
         json.dump(settings, stream, indent=2)
 
 
-def find_executables(
-    paths: list[str],
-    recursive: bool = True,
-    exclude_folders: list[str] | None = None,
-) -> list[str]:
-    """Find .exe files under each path, skipping any exclude_folders subtree."""
-    exclude_norm: set[str] = set()
-    for ef in exclude_folders or []:
-        if ef:
-            exclude_norm.add(normalize_path(ef))
+# ── scan + apply ─────────────────────────────────────────────────────────────
+def find_executables(folders: list[str], skip_folders: list[str]) -> list[str]:
+    """Find every .exe inside each folder, skipping any skip_folders subtree."""
+    skip = [normalize_path(f) for f in skip_folders if f]
 
-    def _is_excluded(p: Path) -> bool:
-        norm = normalize_path(str(p))
-        for excl in exclude_norm:
-            # True if p is inside (or equal to) an excluded folder
-            if norm == excl or norm.startswith(excl + os.sep):
-                return True
-        return False
+    def skipped(path: Path) -> bool:
+        norm = normalize_path(str(path))
+        return any(norm == s or norm.startswith(s + os.sep) for s in skip)
 
     found = set()
-    for base in paths:
-        if not base:
+    for folder in folders:
+        base = Path(folder).expanduser()
+        if not base.is_dir():
             continue
-        base_path = Path(base).expanduser()
-        if not base_path.exists() or not base_path.is_dir():
-            continue
-        if _is_excluded(base_path):
-            continue
-
-        iterator = base_path.rglob("*.exe") if recursive else base_path.glob("*.exe")
-        for exe in iterator:
-            if exe.is_file() and not _is_excluded(exe.parent):
+        for exe in base.rglob("*.exe"):
+            if exe.is_file() and not skipped(exe):
                 found.add(str(exe.resolve()))
     return sorted(found)
 
 
-def get_network_active_executables() -> set[str] | None:
-    if psutil is None:
-        return None
-
-    exes = set()
-    for connection in psutil.net_connections(kind="inet"):
-        if connection.pid is None:
-            continue
-        if not connection.raddr:
-            continue
-        try:
-            proc = psutil.Process(connection.pid)
-            proc_exe = proc.exe()
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied,
-            psutil.ZombieProcess,
-            OSError,
-        ):
-            continue
-        if proc_exe:
-            exes.add(normalize_path(proc_exe))
-    return exes
-
-
-# Proton VPN UserSettings.json key names
-_MODE_MAP = {
-    "exclude": ("SplitTunnelingStandardAppsList", "Standard"),
-    "include": ("SplitTunnelingInverseAppsList", "Inverse"),
-}
-
-
-def _parse_app_list(raw: str) -> list[dict]:
-    """Parse the JSON-encoded app list string from Proton VPN UserSettings.json."""
-    if not raw:
-        return []
-    try:
-        value = json.loads(raw)
-        return value if isinstance(value, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
-def update_proton_config(
-    config_path: str, exe_paths: list[str], mode: str = "exclude"
-) -> int:
-    """Add exe_paths to the Proton VPN UserSettings.json split-tunneling list.
+def update_proton_config(config_path: str, exe_paths: list[str], mode: str) -> int:
+    """Add exe_paths to Proton VPN's split-tunneling list; return how many were new.
 
     mode='exclude'  -> SplitTunnelingStandardAppsList  (apps that bypass VPN)
     mode='include'  -> SplitTunnelingInverseAppsList   (only these apps use VPN)
-    The Proton VPN app must be closed before calling this.
+    The Proton VPN app must be closed before calling this, or it overwrites the
+    file with its in-memory copy on exit.
     """
-    if mode not in _MODE_MAP:
-        raise ValueError("mode must be 'include' or 'exclude'")
-
     config = Path(config_path)
-    if not config.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    if not config_path or not config.exists():
+        raise FileNotFoundError(f"Proton config file not found: {config_path!r}")
 
     with config.open("r", encoding="utf-8") as stream:
-        profile_data = json.load(stream)
+        data = json.load(stream)
 
-    list_key, vpn_mode_value = _MODE_MAP[mode]
+    list_key, vpn_mode = _MODES[mode]
 
-    # The list is stored as a JSON-encoded *string* inside the settings dict
-    existing_list = _parse_app_list(profile_data.get(list_key, "[]"))
+    # The list is stored as a JSON-encoded *string* inside the settings dict.
+    try:
+        apps = json.loads(data.get(list_key) or "[]")
+    except (json.JSONDecodeError, TypeError):
+        apps = []
+    if not isinstance(apps, list):
+        apps = []
 
-    # Build lookup of already-present paths (normalised)
-    existing_norm: set[str] = set()
-    for entry in existing_list:
-        if isinstance(entry, dict) and "AppFilePath" in entry:
-            existing_norm.add(normalize_path(entry["AppFilePath"]))
+    known = {
+        normalize_path(app["AppFilePath"])
+        for app in apps
+        if isinstance(app, dict) and "AppFilePath" in app
+    }
 
-    added_count = 0
+    added = 0
     for exe in exe_paths:
         norm = normalize_path(exe)
-        if norm not in existing_norm:
-            existing_list.append(
-                {
-                    "AppFilePath": os.path.abspath(exe),
-                    "AlternateAppFilePaths": [],
-                    "IsActive": True,
-                }
-            )
-            existing_norm.add(norm)
-            added_count += 1
+        if norm in known:
+            continue
+        apps.append(
+            {
+                "AppFilePath": os.path.abspath(exe),
+                "AlternateAppFilePaths": [],
+                "IsActive": True,
+            }
+        )
+        known.add(norm)
+        added += 1
 
-    # Store back as a compact JSON-encoded string (matches Proton VPN's own format)
-    profile_data[list_key] = json.dumps(existing_list, separators=(",", ":"))
-    profile_data["SplitTunnelingMode"] = vpn_mode_value
-    profile_data["IsSplitTunnelingEnabled"] = "true"
+    data[list_key] = json.dumps(apps, separators=(",", ":"))
+    data["SplitTunnelingMode"] = vpn_mode
+    data["IsSplitTunnelingEnabled"] = "true"
 
-    # Write back preserving Proton VPN's compact outer format (no indentation)
     with config.open("w", encoding="utf-8") as stream:
-        json.dump(profile_data, stream, indent=2, ensure_ascii=False)
+        json.dump(data, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
 
-    return added_count
+    return added
 
 
 def scan_and_apply(settings: dict) -> tuple[int, int]:
-    if not settings.get("proton_config_path"):
-        raise ValueError("'proton_config_path' is empty in settings.json")
-
-    scan_paths = settings.get("scan_paths", [])
-    exclude_folders = settings.get(
-        "exclude_scan_folders", list(_DEFAULT_EXCLUDE_FOLDERS)
-    )
-    recursive = bool(settings.get("recursive", True))
-    only_network_active = bool(settings.get("only_network_active", True))
-    mode = settings.get("mode", "exclude")
-
-    all_exes = find_executables(
-        scan_paths, recursive=recursive, exclude_folders=exclude_folders
-    )
-    filtered = all_exes
-
-    if only_network_active:
-        network_exes = get_network_active_executables()
-        if network_exes is not None:
-            filtered = [exe for exe in all_exes if normalize_path(exe) in network_exes]
-
-    added = update_proton_config(settings["proton_config_path"], filtered, mode=mode)
-    return len(filtered), added
+    """Return (executables found, new entries added)."""
+    exes = find_executables(settings["scan_paths"], settings["exclude_scan_folders"])
+    added = update_proton_config(settings["proton_config_path"], exes, settings["mode"])
+    return len(exes), added
 
 
-# Colour palette used by the listboxes (updated by _apply_listbox_theme)
-_LB_DARK = {
-    "bg": "#1c1c1c",
-    "fg": "#e0e0e0",
-    "selectbg": "#3a3a3a",
-    "selectfg": "#ffffff",
-}
-_LB_LIGHT = {
-    "bg": "#ffffff",
-    "fg": "#000000",
-    "selectbg": "#0078d4",
-    "selectfg": "#ffffff",
-}
+def launch_proton(exe_path: str) -> None:
+    if not Path(exe_path).exists():
+        raise FileNotFoundError(f"Proton VPN launcher not found: {exe_path}")
+    subprocess.Popen([exe_path], close_fds=True)
+
+
+# ── run at logon ─────────────────────────────────────────────────────────────
+def _startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        # Running as a PyInstaller exe — call it directly
+        return f'"{sys.executable}" {_APPLY_FLAG}'
+    # pythonw.exe has no console window
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    python = pythonw if pythonw.exists() else sys.executable
+    return f'"{python}" "{Path(__file__).resolve()}" {_APPLY_FLAG}'
+
+
+def is_startup_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            winreg.QueryValueEx(key, _RUN_NAME)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def set_startup(enabled: bool) -> None:
+    """Add or remove the HKCU Run entry (per-user, no admin needed)."""
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, _RUN_NAME, 0, winreg.REG_SZ, _startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, _RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+class FolderList:
+    """A labelled listbox of folders with Add / Remove buttons."""
+
+    def __init__(self, parent: ttk.Frame, row: int, label: str):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", pady=(10, 0))
+        self.listbox = tk.Listbox(parent, height=6)
+        self.listbox.grid(row=row, column=1, sticky="nsew", pady=(10, 0), padx=6)
+        parent.rowconfigure(row, weight=1)
+
+        buttons = ttk.Frame(parent)
+        buttons.grid(row=row, column=2, sticky="n", pady=(10, 0))
+        ttk.Button(buttons, text="Add", command=self.add).grid(sticky="ew", pady=2)
+        ttk.Button(buttons, text="Remove", command=self.remove).grid(
+            sticky="ew", pady=2
+        )
+
+    def get(self) -> list[str]:
+        return list(self.listbox.get(0, tk.END))
+
+    def set(self, folders: list[str]) -> None:
+        self.listbox.delete(0, tk.END)
+        for folder in folders:
+            self.listbox.insert(tk.END, folder)
+
+    def add(self) -> None:
+        folder = filedialog.askdirectory()
+        if folder and folder not in self.get():
+            self.listbox.insert(tk.END, folder)
+
+    def remove(self) -> None:
+        for index in reversed(self.listbox.curselection()):
+            self.listbox.delete(index)
 
 
 class ProtonAutoPathsUI:
@@ -306,366 +252,120 @@ class ProtonAutoPathsUI:
         self.root = root
         self.root.title("Proton VPN Split Tunneling Auto Paths")
         self.settings = load_settings()
-        self._build_ui()
-        self._load_settings_to_ui()
 
-    def _build_ui(self):
-        frame = ttk.Frame(self.root, padding=12)
+        frame = ttk.Frame(root, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
-
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
-        self._listboxes: list[tk.Listbox] = []
 
-        ttk.Label(frame, text="Proton config (JSON):").grid(row=0, column=0, sticky="w")
-        self.config_var = tk.StringVar()
+        ttk.Label(frame, text="Proton config:").grid(row=0, column=0, sticky="w")
+        self.config_var = tk.StringVar(value=self.settings["proton_config_path"])
         ttk.Entry(frame, textvariable=self.config_var).grid(
             row=0, column=1, sticky="ew", padx=6
         )
         ttk.Button(frame, text="Browse", command=self.pick_config).grid(row=0, column=2)
 
-        ttk.Label(frame, text="Mode:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.mode_var = tk.StringVar(value="exclude")
+        ttk.Label(frame, text="Apps in folders:").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        self.mode_var = tk.StringVar(value=self.settings["mode"])
         mode_frame = ttk.Frame(frame)
-        mode_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Combobox(
-            mode_frame,
-            textvariable=self.mode_var,
-            values=["exclude", "include"],
-            state="readonly",
-            width=12,
+        mode_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0), padx=6)
+        ttk.Radiobutton(
+            mode_frame, text="bypass the VPN", variable=self.mode_var, value="exclude"
         ).grid(row=0, column=0)
-        self._mode_hint = ttk.Label(
+        ttk.Radiobutton(
             mode_frame,
-            text="  exclude = Standard (apps bypass VPN)   include = Inverse (only these apps use VPN)",
-        )
-        self._mode_hint.grid(row=0, column=1, sticky="w", padx=(6, 0))
+            text="are the only ones using the VPN",
+            variable=self.mode_var,
+            value="include",
+        ).grid(row=0, column=1, padx=(12, 0))
 
-        self.recursive_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame, text="Recursive scan", variable=self.recursive_var).grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
-        )
+        self.folders = FolderList(frame, 2, "Folders:")
+        self.folders.set(self.settings["scan_paths"])
+        self.skipped = FolderList(frame, 3, "Skip folders:")
+        self.skipped.set(self.settings["exclude_scan_folders"])
 
-        self.network_only_var = tk.BooleanVar(value=True)
+        self.launch_var = tk.BooleanVar(value=self.settings["launch_proton_after_apply"])
+        ttk.Checkbutton(
+            frame, text="Launch Proton VPN after applying", variable=self.launch_var
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        self.startup_var = tk.BooleanVar(value=is_startup_enabled())
         ttk.Checkbutton(
             frame,
-            text="Only running apps with network activity",
-            variable=self.network_only_var,
-        ).grid(row=2, column=1, sticky="w", pady=(8, 0))
+            text="Apply at every Windows logon "
+            "(remove Proton VPN from your startup apps so this runs first)",
+            variable=self.startup_var,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        ttk.Label(frame, text="Scan paths:").grid(
-            row=3, column=0, sticky="nw", pady=(10, 0)
+        self.warn_label = ttk.Label(
+            frame, text="⚠  Close Proton VPN before applying changes."
         )
-        self.paths_list = tk.Listbox(frame, height=6)
-        self._listboxes.append(self.paths_list)
-        self.paths_list.grid(row=3, column=1, sticky="nsew", pady=(10, 0), padx=6)
-        frame.rowconfigure(3, weight=1)
+        self.warn_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        btn_col = ttk.Frame(frame)
-        btn_col.grid(row=3, column=2, sticky="ns", pady=(10, 0))
-        ttk.Button(btn_col, text="Add Path", command=self.add_path).grid(
-            row=0, column=0, sticky="ew", pady=2
-        )
-        ttk.Button(btn_col, text="Remove Selected", command=self.remove_path).grid(
-            row=1, column=0, sticky="ew", pady=2
+        actions = ttk.Frame(frame)
+        actions.grid(row=7, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(actions, text="Save", command=self.save).grid(row=0, column=0)
+        ttk.Button(actions, text="Save + Apply", command=self.apply).grid(
+            row=0, column=1, padx=(6, 0)
         )
 
-        ttk.Label(frame, text="Exclude folders:").grid(
-            row=4, column=0, sticky="nw", pady=(10, 0)
+    def apply_theme(self, dark: bool) -> None:
+        """Plain tk.Listbox is not styled by ttk themes, so colour it by hand."""
+        bg, fg, select = (
+            ("#1c1c1c", "#e0e0e0", "#3a3a3a") if dark else ("#ffffff", "#000000", "#0078d4")
         )
-        self.exclude_list = tk.Listbox(frame, height=5)
-        self._listboxes.append(self.exclude_list)
-        self.exclude_list.grid(row=4, column=1, sticky="nsew", pady=(10, 0), padx=6)
-        frame.rowconfigure(4, weight=1)
-        self._excl_hint = ttk.Label(
-            frame,
-            text="(subfolders of scan paths to skip — Proton VPN dir excluded by default)",
-        )
-        self._excl_hint.grid(row=5, column=1, sticky="w", padx=6)
-
-        excl_btn_col = ttk.Frame(frame)
-        excl_btn_col.grid(row=4, column=2, sticky="ns", pady=(10, 0))
-        ttk.Button(
-            excl_btn_col, text="Add Exclude", command=self.add_exclude_path
-        ).grid(row=0, column=0, sticky="ew", pady=2)
-        ttk.Button(
-            excl_btn_col, text="Remove Selected", command=self.remove_exclude_path
-        ).grid(row=1, column=0, sticky="ew", pady=2)
-
-        self._warn_label = ttk.Label(
-            frame,
-            text="⚠  Close Proton VPN before applying changes.",
-        )
-        self._warn_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-        # --- Proton launcher + startup ---
-        ttk.Label(frame, text="Proton launcher:").grid(
-            row=7, column=0, sticky="w", pady=(8, 0)
-        )
-        self.proton_exe_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.proton_exe_var).grid(
-            row=7, column=1, sticky="ew", padx=6, pady=(8, 0)
-        )
-        ttk.Button(frame, text="Browse", command=self.pick_proton_exe).grid(
-            row=7, column=2, pady=(8, 0)
-        )
-
-        self.launch_after_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frame,
-            text="Launch Proton VPN after applying (recommended for startup use)",
-            variable=self.launch_after_var,
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        startup_row = ttk.Frame(frame)
-        startup_row.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Button(
-            startup_row,
-            text="Register Startup Task",
-            command=self.register_startup,
-        ).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(
-            startup_row,
-            text="Unregister Startup Task",
-            command=self.unregister_startup,
-        ).grid(row=0, column=1)
-        self._startup_hint = ttk.Label(
-            startup_row,
-            text="  Runs --scan-and-apply at every Windows logon (remove Proton VPN from startup apps)",
-        )
-        self._startup_hint.grid(row=0, column=2, sticky="w", padx=(6, 0))
-
-        action_row = ttk.Frame(frame)
-        action_row.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        action_row.columnconfigure(2, weight=1)
-        ttk.Button(
-            action_row, text="Add EXE Manually", command=self.add_exe_manually
-        ).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(action_row, text="Save Settings", command=self.save_from_ui).grid(
-            row=0, column=1, padx=(0, 6)
-        )
-        ttk.Button(
-            action_row, text="Scan + Apply", command=self.scan_apply_from_ui
-        ).grid(row=0, column=2, sticky="e")
-
-    def _apply_listbox_theme(self, dark: bool) -> None:
-        pal = _LB_DARK if dark else _LB_LIGHT
-        hint_fg = "#aaaaaa" if dark else "#888888"
-        warn_fg = "#ffaa44" if dark else "#cc6600"
-        for lb in self._listboxes:
-            lb.configure(
-                bg=pal["bg"],
-                fg=pal["fg"],
-                selectbackground=pal["selectbg"],
-                selectforeground=pal["selectfg"],
-                highlightbackground=pal["bg"],
+        for folder_list in (self.folders, self.skipped):
+            folder_list.listbox.configure(
+                bg=bg,
+                fg=fg,
+                selectbackground=select,
+                selectforeground="#ffffff",
+                highlightbackground=bg,
             )
-        for lbl in (self._mode_hint, self._excl_hint, self._startup_hint):
-            lbl.configure(foreground=hint_fg)
-        self._warn_label.configure(foreground=warn_fg)
+        self.warn_label.configure(foreground="#ffaa44" if dark else "#cc6600")
 
-    def _load_settings_to_ui(self):
-        self.config_var.set(self.settings.get("proton_config_path", ""))
-        self.proton_exe_var.set(
-            self.settings.get(
-                "proton_exe_path", r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe"
-            )
-        )
-        self.launch_after_var.set(
-            bool(self.settings.get("launch_proton_after_apply", True))
-        )
-        self.mode_var.set(self.settings.get("mode", "exclude"))
-        self.recursive_var.set(bool(self.settings.get("recursive", True)))
-        self.network_only_var.set(bool(self.settings.get("only_network_active", True)))
-
-        self.paths_list.delete(0, tk.END)
-        for path in self.settings.get("scan_paths", []):
-            self.paths_list.insert(tk.END, path)
-
-        self.exclude_list.delete(0, tk.END)
-        excl = self.settings.get("exclude_scan_folders", list(_DEFAULT_EXCLUDE_FOLDERS))
-        for path in excl:
-            self.exclude_list.insert(tk.END, path)
-
-    def _collect_paths_from_ui(self) -> list[str]:
-        return [self.paths_list.get(i) for i in range(self.paths_list.size())]
-
-    def _collect_excludes_from_ui(self) -> list[str]:
-        return [self.exclude_list.get(i) for i in range(self.exclude_list.size())]
-
-    def _settings_from_ui(self) -> dict:
-        return {
-            "proton_config_path": self.config_var.get().strip(),
-            "proton_exe_path": self.proton_exe_var.get().strip(),
-            "launch_proton_after_apply": self.launch_after_var.get(),
-            "scan_paths": self._collect_paths_from_ui(),
-            "exclude_scan_folders": self._collect_excludes_from_ui(),
-            "mode": self.mode_var.get(),
-            "recursive": self.recursive_var.get(),
-            "only_network_active": self.network_only_var.get(),
-        }
-
-    def pick_config(self):
+    def pick_config(self) -> None:
         path = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            initialdir=_PROTON_STORAGE if _PROTON_STORAGE.is_dir() else None,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if path:
             self.config_var.set(path)
 
-    def pick_proton_exe(self):
-        path = filedialog.askopenfilename(
-            title="Select Proton VPN launcher",
-            filetypes=[("Executables", "*.exe")],
+    def _save(self) -> None:
+        self.settings.update(
+            {
+                "proton_config_path": self.config_var.get().strip(),
+                "launch_proton_after_apply": self.launch_var.get(),
+                "scan_paths": self.folders.get(),
+                "exclude_scan_folders": self.skipped.get(),
+                "mode": self.mode_var.get(),
+            }
         )
-        if path:
-            self.proton_exe_var.set(path)
+        save_settings(self.settings)
+        set_startup(self.startup_var.get())
 
-    def register_startup(self):
+    def save(self) -> None:
         try:
-            save_settings(self._settings_from_ui())
-            register_startup_task()
+            self._save()
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
             return
-        messagebox.showinfo(
-            "Registered",
-            f"Task '{_TASK_NAME}' registered.\n\nRemember to remove Proton VPN from your startup apps so this script runs first.",
-        )
-
-    def unregister_startup(self):
-        try:
-            unregister_startup_task()
-        except Exception as exc:
-            messagebox.showerror("Error", str(exc))
-            return
-        messagebox.showinfo("Unregistered", f"Task '{_TASK_NAME}' removed.")
-
-    def add_path(self):
-        path = filedialog.askdirectory()
-        if not path:
-            return
-        existing = self._collect_paths_from_ui()
-        if path not in existing:
-            self.paths_list.insert(tk.END, path)
-
-    def remove_path(self):
-        selected = list(self.paths_list.curselection())
-        for index in reversed(selected):
-            self.paths_list.delete(index)
-
-    def add_exclude_path(self):
-        path = filedialog.askdirectory(title="Select folder to exclude from scan")
-        if not path:
-            return
-        existing = self._collect_excludes_from_ui()
-        if path not in existing:
-            self.exclude_list.insert(tk.END, path)
-
-    def remove_exclude_path(self):
-        selected = list(self.exclude_list.curselection())
-        for index in reversed(selected):
-            self.exclude_list.delete(index)
-
-    def save_from_ui(self):
-        settings = self._settings_from_ui()
-        save_settings(settings)
-        self.settings = settings
         messagebox.showinfo("Saved", f"Settings saved to {SETTINGS_FILE}")
 
-    def add_exe_manually(self):
-        config_path = self.config_var.get().strip()
-        mode = self.mode_var.get().strip()
-        exe_path = filedialog.askopenfilename(filetypes=[("Executables", "*.exe")])
-        if not exe_path:
-            return
+    def apply(self) -> None:
         try:
-            added = update_proton_config(config_path, [exe_path], mode=mode)
-        except Exception as exc:
-            messagebox.showerror("Error", str(exc))
-            return
-        messagebox.showinfo("Done", f"Added {added} executable(s).")
-
-    def scan_apply_from_ui(self):
-        settings = self._settings_from_ui()
-        try:
-            save_settings(settings)
-            matched_count, added_count = scan_and_apply(settings)
+            self._save()
+            found, added = scan_and_apply(self.settings)
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
             return
         messagebox.showinfo(
-            "Finished",
-            f"Matched executables: {matched_count}\nNew entries added: {added_count}",
+            "Finished", f"Executables found: {found}\nNew entries added: {added}"
         )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Proton VPN split tunneling auto path updater"
-    )
-    parser.add_argument("--ui", action="store_true", help="Launch Tkinter UI")
-    parser.add_argument(
-        "--scan-and-apply",
-        action="store_true",
-        help="Run scan and update once using settings",
-    )
-    parser.add_argument("--config", help="Override Proton config JSON path")
-    parser.add_argument(
-        "--mode", choices=["include", "exclude"], help="Split tunneling mode"
-    )
-    parser.add_argument(
-        "--add-path", action="append", help="Add scan path to settings (can repeat)"
-    )
-    parser.add_argument(
-        "--remove-path",
-        action="append",
-        help="Remove scan path from settings (can repeat)",
-    )
-    parser.add_argument(
-        "--network-only",
-        action="store_true",
-        help="Only add executables with active network connections",
-    )
-    parser.add_argument(
-        "--all-exes", action="store_true", help="Disable network-only filter"
-    )
-    parser.add_argument(
-        "--non-recursive", action="store_true", help="Scan only top-level directory"
-    )
-    parser.add_argument(
-        "--save-only",
-        action="store_true",
-        help="Apply CLI overrides and save settings only",
-    )
-    return parser.parse_args()
-
-
-def apply_cli_overrides(settings: dict, args: argparse.Namespace) -> dict:
-    merged = dict(settings)
-
-    if args.config:
-        merged["proton_config_path"] = args.config
-    if args.mode:
-        merged["mode"] = args.mode
-    if args.non_recursive:
-        merged["recursive"] = False
-    if args.network_only:
-        merged["only_network_active"] = True
-    if args.all_exes:
-        merged["only_network_active"] = False
-
-    paths = list(merged.get("scan_paths", []))
-    if args.add_path:
-        for path in args.add_path:
-            if path not in paths:
-                paths.append(path)
-    if args.remove_path:
-        remove_set = set(args.remove_path)
-        paths = [path for path in paths if path not in remove_set]
-    merged["scan_paths"] = paths
-
-    return merged
 
 
 def run_gui() -> None:
@@ -677,62 +377,33 @@ def run_gui() -> None:
     ui = ProtonAutoPathsUI(root)
 
     # Apply Sun Valley theme based on system preference
-    dark = (darkdetect.isDark() if darkdetect else False) or False
+    dark = bool(darkdetect and darkdetect.isDark())
     if sv_ttk:
         sv_ttk.set_theme("dark" if dark else "light")
-    ui._apply_listbox_theme(dark)
+    ui.apply_theme(dark)
 
     root.mainloop()
 
 
-def run_click_and_run() -> int:
+def run_headless() -> int:
+    """Apply the saved settings without a window, then start Proton VPN."""
     settings = load_settings()
-    matched_count, added_count = scan_and_apply(settings)
-    print(f"Matched executables: {matched_count}")
-    print(f"New entries added: {added_count}")
-    if settings.get("only_network_active", True) and psutil is None:
-        print("Note: Install 'psutil' for accurate network-activity filtering.")
-    if settings.get("launch_proton_after_apply", True):
-        exe = settings.get(
-            "proton_exe_path", r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe"
-        )
+    found, added = scan_and_apply(settings)
+    print(f"Executables found: {found}")
+    print(f"New entries added: {added}")
+    if settings["launch_proton_after_apply"]:
         try:
-            launch_proton(exe)
-            print(f"Launched: {exe}")
+            launch_proton(settings["proton_exe_path"])
         except Exception as exc:
             print(f"Warning: could not launch Proton VPN: {exc}")
     return 0
 
 
 def main() -> int:
-    args = parse_args()
-    settings = load_settings()
-    updated_settings = apply_cli_overrides(settings, args)
-
-    if updated_settings != settings or args.save_only:
-        save_settings(updated_settings)
-
-    if args.ui:
-        run_gui()
-        return 0
-
-    if args.scan_and_apply or not any(vars(args).values()):
-        matched_count, added_count = scan_and_apply(updated_settings)
-        print(f"Matched executables: {matched_count}")
-        print(f"New entries added: {added_count}")
-        if updated_settings.get("only_network_active", True) and psutil is None:
-            print("Note: Install 'psutil' for accurate network-activity filtering.")
-        if updated_settings.get("launch_proton_after_apply", True):
-            exe = updated_settings.get(
-                "proton_exe_path", r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe"
-            )
-            try:
-                launch_proton(exe)
-                print(f"Launched: {exe}")
-            except Exception as exc:
-                print(f"Warning: could not launch Proton VPN: {exc}")
-        return 0
-
+    """`--scan-and-apply` runs headless; anything else opens the window."""
+    if _APPLY_FLAG in sys.argv[1:]:
+        return run_headless()
+    run_gui()
     return 0
 
 

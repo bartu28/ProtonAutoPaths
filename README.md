@@ -4,13 +4,12 @@ A Windows GUI tool that automatically scans directories for executables and upda
 
 ## Features
 
-- **Auto-scan** folders (recursively or flat) for `.exe` files
+- **Folder based** – every `.exe` inside the folders you pick (subfolders included) is added
 - **Two split-tunneling modes**
   - `exclude` (Standard) – listed apps bypass the VPN
   - `include` (Inverse) – only listed apps use the VPN
-- **Network-active filter** – optionally limit the list to executables that currently have active network connections (requires `psutil`)
-- **Exclude folders** – skip subtrees (e.g. Proton VPN's own install directory) so the VPN client itself is never routed through its own tunnel
-- **Run at startup** – register/unregister a Windows startup entry (no admin rights needed)
+- **Skip folders** – skip subtrees (e.g. Proton VPN's own install directory) so the VPN client itself is never routed through its own tunnel
+- **Run at logon** – one checkbox adds/removes a Windows startup entry (no admin rights needed)
 - **Dark/light theme** auto-detected via `darkdetect` and styled with `sv_ttk`
 
 ## Requirements
@@ -19,11 +18,10 @@ A Windows GUI tool that automatically scans directories for executables and upda
 - Proton VPN installed (desktop client)
 - Python 3.10+ **or** the pre-built `.exe` from the [Releases](../../releases) page
 
-Optional Python packages (installed automatically when using `pip`):
+Optional Python packages (theme only):
 ```
 sv_ttk
 darkdetect
-psutil
 ```
 
 ## Usage
@@ -33,22 +31,22 @@ Download `ProtonAutoPaths.exe` from the [Releases](../../releases) page and run 
 
 ### From source
 ```bash
-pip install sv_ttk darkdetect psutil
-python gui_launcher.py
+pip install sv_ttk darkdetect
+python main.py
 ```
 
 ### GUI walkthrough
-1. **Proton config (JSON)** – browse to Proton VPN's `UserSettings.json` (usually `%LOCALAPPDATA%\ProtonVPN\UserSettings.json`).
-2. **Scan paths** – add the folders you want to scan for executables (e.g. `C:\Program Files`).
-3. **Exclude folders** – add any folders to skip (Proton VPN's own folder is excluded by default).
-4. **Mode** – choose `exclude` or `include`.
-5. Click **Scan & Apply** – the tool closes Proton VPN if running, updates the config, and optionally re-launches it.
+1. **Proton config** – filled in automatically from `%LOCALAPPDATA%\Proton\Proton VPN\Storage\UserSettings.*.json`; browse only if it is wrong.
+2. **Apps in folders** – choose whether they bypass the VPN or are the only ones using it.
+3. **Folders** – add the folders whose executables you want listed.
+4. **Skip folders** – add any subfolders to leave out (Proton VPN's own folder is skipped by default).
+5. Close Proton VPN, then click **Save + Apply**. Proton VPN overwrites the file on exit, so changes made while it is running are lost.
 
 ### Headless / startup mode
 ```bash
 ProtonAutoPaths.exe --scan-and-apply
 ```
-Run with `--scan-and-apply` to apply the saved settings silently (useful for the startup entry).
+Applies the saved settings without a window, then launches Proton VPN. This is what the logon entry runs. Any other invocation opens the window.
 
 ## Settings
 
